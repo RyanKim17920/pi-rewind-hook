@@ -422,6 +422,7 @@ export default function rewindExtension(pi: ExtensionAPI) {
     currentParentSession = undefined;
     currentSessionCwd = undefined;
     isGitRepo = false;
+    usingFallbackRepo = false;
     lastExact = null;
     activeBranchState = {};
     promptCollector = null;
@@ -766,8 +767,6 @@ export default function rewindExtension(pi: ExtensionAPI) {
               break;
             }
           } catch {
-            // Ignore malformed header lines from partial/corrupt session files.
-            continue;
           }
         }
         parsedSessionCache.set(sessionFile, { mtimeMs: fileStat.mtimeMs, ledger });
@@ -999,7 +998,7 @@ export default function rewindExtension(pi: ExtensionAPI) {
 
       const ledger = sessionFile === currentSessionFile ? buildCurrentSessionLedger(ctx) : await parseSessionLedgerFile(sessionFile);
       if (!ledger?.cwd) continue;
-      if (!isInsidePath(ledger.cwd, repoRoot)) continue;
+      if (!usingFallbackRepo && !isInsidePath(ledger.cwd, repoRoot)) continue;
       ledgers.push(ledger);
     }
 
@@ -1107,6 +1106,7 @@ export default function rewindExtension(pi: ExtensionAPI) {
     await reconstructState(ctx);
     updateStatus(ctx);
   }
+  let usingFallbackRepo = false;
 
   async function initializeForSession(ctx: ExtensionContext) {
     activeContext = ctx;
@@ -1117,8 +1117,36 @@ export default function rewindExtension(pi: ExtensionAPI) {
       const result = await pi.exec("git", ["rev-parse", "--is-inside-work-tree"]);
       isGitRepo = result.code === 0 && result.stdout.trim() === "true";
     } catch {
-      // Treat git probing failures as non-git context for this session.
       isGitRepo = false;
+    }
+
+    if (!isGitRepo) {
+      // Fallback: auto-create and use ~/.pi/agent/rewind-data/ as a dedicated git repo
+      const rewindDir = process.env.HOME + "/.pi/agent/rewind-data";
+      try {
+        // Check if it's already a git repo
+        const result = await pi.exec("git", ["-C", rewindDir, "rev-parse", "--is-inside-work-tree"]);
+        isGitRepo = result.code === 0 && result.stdout.trim() === "true";
+      } catch {
+        // Doesn't exist or not a git repo — create it
+        try {
+          await pi.exec("mkdir", ["-p", rewindDir]);
+          await pi.exec("git", ["init", rewindDir]);
+          await pi.exec("git", ["-C", rewindDir, "config", "user.email", "rewind@pi.dev"]);
+          await pi.exec("git", ["-C", rewindDir, "config", "user.name", "pi-rewind"]);
+          await pi.exec("sh", ["-c", "echo -n > " + rewindDir + "/.session"]);
+          await pi.exec("git", ["-C", rewindDir, "add", "-A"]);
+          await pi.exec("git", ["-C", rewindDir, "commit", "-m", "init"]);
+          isGitRepo = true;
+        } catch {
+          isGitRepo = false;
+        }
+      }
+      if (isGitRepo) {
+        process.env.GIT_DIR = rewindDir + "/.git";
+        process.env.GIT_WORK_TREE = rewindDir;
+        usingFallbackRepo = true;
+      }
     }
 
     if (!isGitRepo) {
@@ -1133,6 +1161,7 @@ export default function rewindExtension(pi: ExtensionAPI) {
       notify(ctx, `Rewind retention startup sweep failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
     });
   }
+
 
   pi.events.on("rewind:fork-preference", (data) => {
     if (!data || typeof data !== "object") return;
